@@ -1,0 +1,9 @@
+<test name="Copy 100 books test">
+	<lipc-listen name="com.lab126.ccat" event="updated" />
+	<verify-dir dir="/mnt/us/books/100_books" />
+	<verify-dir dir="/mnt/us/documents/" />
+	<cp src="/mnt/us/books/100_books" dst="/mnt/us/documents/" />
+	<sleep ms="10000" />
+	<exec cmd="restart scanner" />
+	<sleep ms="100000" />
+</test>

@@ -1,0 +1,5 @@
+Version: SBR-v-7.9
+P4 Tag: ${tag}/
+Lab126 Jenkins Official Build/
+jenkins-02_EInkReader_SBR7_Release-10
+

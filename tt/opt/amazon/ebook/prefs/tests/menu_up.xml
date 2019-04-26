@@ -1,0 +1,20 @@
+<test name="Menu Up test">
+	<loop num="7">
+		<menu-up />
+		<clear-event-queue />
+		<sleep ms="2000" /> 
+		<tap x="300" y="700" />
+		<clear-event-queue />
+		<sleep ms="2000" /> 
+	</loop>
+		
+	<!-- profile-start /-->
+	<menu-up profile="true" />
+	<clear-event-queue profile="true" />
+	<sleep ms="2000" /> 
+	<tap x="300" y="700" profile="true" />
+	<clear-event-queue profile="true" />
+	<!-- profile-stop />
+	<profile-dump cutoff="200" />
+	<profile-calltree file="/tmp/java.calltree" /-->
+</test>

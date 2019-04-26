@@ -1,0 +1,21 @@
+#!/bin/sh
+
+WFM_MOUNT=/mnt/wfm
+
+if mount | grep -q $WFM_MOUNT ; then
+    echo "waveform filesystem already mounted"
+    exit 0
+fi
+
+echo "mounting waveform filesystem"
+
+# Set up loop as offset 0x1C41000 from flash root
+losetup -o $(( 4096 * 7233 )) /dev/loop/1 /dev/mmcblk0
+mount /dev/loop/1 $WFM_MOUNT
+if [ $? -ne 0 ]; then
+    echo "image not found, creating"
+    
+    # block count is # of 1024 byte blocks
+    mkdosfs -F 32 -s 16 -S 1024 -t 3836 /dev/loop/1
+    mount /dev/loop/1 $WFM_MOUNT
+fi

@@ -1,0 +1,9 @@
+<test name="Copy books">
+	<lipc-listen name="com.lab126.ccat" event="updated" />
+	<verify-dir dir="/mnt/us/kindle_books" />
+	<verify-dir dir="/mnt/us/documents/" />
+	<cp src="/mnt/us/kindle_books/" dst="/mnt/us/documents/" />
+	<sleep ms="10000" />
+	<exec cmd="restart scanner" />
+	<sleep ms="60000" />
+</test>

@@ -1,0 +1,7 @@
+#!/bin/sh
+
+echo "umounting waveform filesystem"
+    
+sync
+umount /mnt/wfm
+losetup -d /dev/loop/1

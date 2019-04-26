@@ -1,0 +1,51 @@
+<test name="Next/Prev Page test">
+	<loop num="7">
+		<sleep ms="1000" />
+		<next-page />
+		<clear-event-queue />
+	</loop>
+	<loop num="7">
+		<sleep ms="1000" />
+		<prev-page />
+		<clear-event-queue />
+	</loop>
+	<loop num="7">
+		<sleep ms="1000" />
+		<next-page />
+		<clear-event-queue />
+	</loop>
+	<loop num="7">
+		<sleep ms="1000" />
+		<prev-page />
+		<clear-event-queue />
+	</loop>
+		
+	<!-- profile-start /-->
+	<sleep ms="1000" />
+	<next-page profile="true" />
+	<clear-event-queue profile="true" />
+	<sleep ms="1000" />
+	<next-page profile="true" />
+	<clear-event-queue profile="true" />
+	<sleep ms="1000" />
+	<next-page profile="true" />
+	<clear-event-queue profile="true" />
+	<sleep ms="1000" />
+	<next-page profile="true" />
+	<clear-event-queue profile="true" />	
+	<sleep ms="1000" />
+	<prev-page profile="true" />
+	<clear-event-queue profile="true" />
+	<sleep ms="1000" />
+	<prev-page profile="true" />
+	<clear-event-queue profile="true" />
+	<sleep ms="1000" />
+	<prev-page profile="true" />
+	<clear-event-queue profile="true" />
+	<sleep ms="1000" />
+	<prev-page profile="true" />
+	<clear-event-queue profile="true" />
+	<!-- profile-stop />
+	<profile-dump cutoff="200" />
+	<profile-calltree file="/tmp/java.calltree" /-->
+</test>

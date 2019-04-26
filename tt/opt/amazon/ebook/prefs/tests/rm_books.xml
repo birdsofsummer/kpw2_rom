@@ -1,0 +1,6 @@
+<test>
+	<lipc-listen name="com.lab126.ccat" event="updated" />
+	<verify-dir dir="/mnt/us/documents/" />
+	<rm src="/mnt/us/documents/" />
+	<sleep ms="100000" />
+</test>

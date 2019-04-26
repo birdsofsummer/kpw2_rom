@@ -1,0 +1,152 @@
+#!/bin/sh
+# Helper script to find / install correct waveforms for FSL EDPC driver
+#
+
+source /etc/upstart/functions
+
+EINK_RO_DIR=/opt/eink
+EINK_RW_DIR=/var/local/eink
+EINK_WF_DIR=${EINK_RW_DIR}/waveforms
+TEMP_DIR=/tmp
+
+EINK_PROC=/proc/eink
+EINK_PNL_WFM_PROC=${EINK_PROC}/panel/waveform
+EINK_ROM=${EINK_PNL_WFM_PROC}/data
+EINK_WAVEFORM_NAME=`cat ${EINK_PNL_WFM_PROC}/human_version`
+EINK_WAVEFORM_SOURCE=${EINK_PROC}/waveform/source
+EINK_PROC_COMPACTMEM=/proc/sys/vm/compact_memory
+
+if [ -z $EINK_WAVEFORM_NAME ]; then
+  EINK_WAVEFORM_NAME="noname"
+fi
+
+_WBF="wbf" # eink waveform
+_WRF="wrf" # freescale waveform
+
+_WFM_DIR=/mnt/wfm
+WFM_PATH="${_WFM_DIR}/waveform_to_use"
+WFM_DO_NOT_UPDATE_FILE="${WFM_PATH}/DO_NOT_UPDATE"
+WFM_DIRTY_FLAG="${_WFM_DIR}/WFM_DIRTY_FLAG"
+
+get_is_epdc_unloaded()
+{
+    lsmod | (grep -q mxc_epdc_fb && echo found || echo not_found) | grep -q not_found
+}
+
+#============================end of helper functions==================================
+
+sync
+
+wfm_mount
+# if dirty flag is found then previous waveform update via ToDo item must have failed. so do a cleanup
+if [ -e ${WFM_DIRTY_FLAG} ]; then 
+  f_log I display update "Waveform dirty flag is found. Deleting wavefrom from partition"
+  rm ${WFM_PATH}/*.$_WRF.gz 2>/dev/null
+  rm ${_WFM_DIR}/DONT_ERASE_WFM
+  rm ${WFM_DIRTY_FLAG}
+fi
+
+modprobe mxc_epdc_fb
+
+# Check to see if there is a panel attached
+#
+if [ ! -e ${EINK_PROC} ]; then
+    f_log W display update "No panel attached!"
+    modprobe -r mxc_epdc_fb
+    exit 1
+fi
+
+# Mount the waveform partition
+#
+if ! wfm_mount ; then
+  f_log W display update "Failed to mount waveform storage area!"
+  f_display splash
+  exit 1
+fi
+
+# Check to see if the waveform should be updated
+#
+if [ -e ${WFM_PATH} ] && [ -e ${WFM_DO_NOT_UPDATE_FILE} ]; then
+  f_log I display update "Found the DO NOT UPDATE flag. Skipping waveform update."
+  wfm_umount
+  f_display splash
+  exit 0
+fi
+
+# Check to make sure that a waveform was properly loaded by the EPDC driver.
+# If not, clear out the waveform partition and choose a new, valid waveform.
+#
+if [ "$(cat ${EINK_WAVEFORM_SOURCE})" = "built-in" ]; then
+  rm ${WFM_PATH}/*.$_WRF.gz 2>/dev/null
+fi
+
+BATCH_CODE="`echo $EINK_WAVEFORM_NAME | cut -d _ -f 2`"
+PART_CODE="`echo $EINK_WAVEFORM_NAME | cut -d _ -f 4`"
+PANEL_CODE="${BATCH_CODE}_${PART_CODE}"
+
+# Check to see if there are any waveform overrides
+#
+f_log I display update "Checking '${EINK_RO_DIR}/images/${PANEL_CODE}' for overrides"
+if [ -e "${EINK_RO_DIR}/images/${PANEL_CODE}" ]; then
+  if [ -e ${WFM_PATH} ] && [ "$(ls -A ${WFM_PATH}/*.$_WRF.gz 2>/dev/null)" ]; then
+    EXISTING_WFM="$(ls -A ${WFM_PATH}/*.$_WRF.gz 2>/dev/null | head -1)"
+    EXISTING_WFM_NAME=$(basename $EXISTING_WFM)
+  fi
+
+  OVERRIDE_WFM="$(ls ${EINK_RO_DIR}/images/${PANEL_CODE}/*.$_WRF.gz 2>/dev/null | head -1)"
+  OVERRIDE_WFM_NAME=$(basename $OVERRIDE_WFM)
+  if [ -e "$OVERRIDE_WFM" ] && [ ! "$OVERRIDE_WFM_NAME" = "$EXISTING_WFM_NAME" ]; then
+    f_log I display update "Overriding ${EXISTING_WFM_NAME} with ${OVERRIDE_WFM_NAME}"
+    wrf_path="$OVERRIDE_WFM"
+  fi
+fi
+
+# No override or existing waveform were found, extract the waveform
+#
+if [ -z $wrf_path ] && [ ! "$(ls -A ${WFM_PATH}/*.$_WRF.gz 2>/dev/null)" ]; then
+  f_log I display update "No waveform found. Extracting waveform from panel."
+
+  waveform_name=$EINK_WAVEFORM_NAME
+
+  waveform_wbf="$EINK_WF_DIR/$waveform_name.$_WBF"
+  waveform_wrf="$EINK_WF_DIR/$waveform_name.$_WRF.gz"
+  waveform_wrf_temp="$TEMP_DIR/$waveform_name.$_WRF"
+
+  mkdir -p ${EINK_WF_DIR}
+
+  cat "$EINK_ROM" > "$waveform_wbf"
+  parse_waveform -o "$waveform_wrf_temp" "$waveform_wbf"
+  gzip "$waveform_wrf_temp"
+  mv "$waveform_wrf_temp.gz" "$waveform_wrf"
+
+  wrf_path="$waveform_wrf"
+
+  f_log I display update "Extracted waveform into $waveform_wbf"
+fi
+
+# Copy the chosen waveform into the waveform partition and remove old waveforms
+#
+if [ -e "$wrf_path" ]; then
+  mkdir -p "${WFM_PATH}"
+  rm "${WFM_PATH}"/*
+  cp "${wrf_path}" "${WFM_PATH}"
+  f_log I display update "Copied waveform from ${wrf_path} into ${WFM_PATH}"
+
+  modprobe -r mxc_epdc_fb
+fi
+
+wfm_umount
+
+# Make sure the epdc driver is loaded
+#
+if get_is_epdc_unloaded; then
+
+  # Run compaction before reloading driver
+  #
+  if [ -e ${EINK_PROC_COMPACTMEM} ]; then
+    echo 1 > "${EINK_PROC_COMPACTMEM}"
+  fi
+
+  modprobe mxc_epdc_fb
+fi
+f_display splash

@@ -1,0 +1,6 @@
+Version: SBR-v-7.0
+P4 Tag: ${tag}/
+                    /
+                    Lab126 Jenkins Official Build/
+                    jenkins-01_BookWizard_SBR3_Release-15
+

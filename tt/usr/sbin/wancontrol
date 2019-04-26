@@ -1,0 +1,610 @@
+#!/bin/sh
+
+# master wancontrol script for wario
+# Copyright (C) 2006-2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+PPP_INTF=ppp0
+
+TTS_WAN=/dev/tts/USB0
+TTS_DM=/dev/tts/USB1
+
+B_PPPD=pppd
+PPPD=/usr/sbin/${B_PPPD}
+
+DROPDTR=/usr/sbin/dropdtr
+
+PIDF_PPPD=/var/run/${PPP_INTF}.pid
+
+PPP_IP_START=/var/run/ppp/ip_start
+PPP_IP_STOP=/var/run/ppp/ip_stop
+WAN_LINK_ACTIVE=/var/run/wan_link_active
+
+PROC_WAN_POWER=/proc/wan/power
+PROC_WAN_TYPE=/proc/wan/type
+PROC_WAN_USB_EN=/proc/wan/usb
+
+WAKEUP_ENABLE=/sys/devices/platform/fsl-ehci.1/wakeup_enable
+DEEP_IDLE_ENABLE=/sys/devices/platform/fsl-ehci.1/deep_idle_enable
+
+ERR_SUCCESS=0
+ERR_ERROR=1
+ERR_INVALID_CMD=128
+ERR_NO_TTS=129
+ERR_PPP_IF=130
+ERR_DMD_FAIL=131
+ERR_PPP_FAIL=132
+ERR_WANID_FAIL=133
+
+_FUNCTIONS=/etc/rc.d/functions
+[ -f ${_FUNCTIONS} ] && . ${_FUNCTIONS}
+
+DTR_PAUSE=4
+
+RECONNECT_RETRIES=3
+
+PPP_IF_UP_RETRIES=60
+PPP_IF_DOWN_RETRIES=65
+
+MCS_COOKIE=/var/run/mcsdwc.dat
+MODEMCMD=/usr/sbin/modemcmd
+
+MCS_SET_AUTO_MODE_OP="0"
+
+unset WAN_TYPE WAN_PEER
+
+WAN_MODULE_INFO_GEN=/usr/sbin/waninfo
+WAN_MODULE_INFO_BASE=/var/local/wan
+WAN_MODULE_INFO=${WAN_MODULE_INFO_BASE}/info
+WAN_MODULE_INFO_FLAG=/var/run/waninfo.ok
+
+source_wan_info()
+{
+	[ -e ${WAN_MODULE_INFO} ] && . ${WAN_MODULE_INFO}
+	if [ "x${WAN_TYPE}" = "x3" -o "x${WAN_TYPE}" = "x4" ] ; then
+		WAN_TYPE_IS_QSC=1
+	else
+		WAN_TYPE_IS_QSC=0   # Unknown WAN type is NOT QSC
+	fi
+}
+
+source_wan_info
+
+LIBWAN_DIR=/usr/lib
+LIBWAN_BASE=${LIBWAN_DIR}/libwan_module
+WANFW_BASE=/opt/wan/firmware
+
+init_wan_info()
+{
+	local _RES=0
+	local _REGEN=0
+
+	if [ ! -f ${WAN_MODULE_INFO_FLAG} -o -z "${WAN_PEER}" ]; then
+		_REGEN=1
+
+		if [ -z "${WAN_PEER}" ]; then
+			rm -f ${WAN_MODULE_INFO}
+		fi
+
+		${WAN_MODULE_INFO_GEN}
+		_RES=$?
+
+		if [ ${_RES} -eq 0 ]; then
+			touch ${WAN_MODULE_INFO_FLAG}
+		fi
+	fi
+
+	source_wan_info
+
+	if [ ${_RES} -ne ${ERR_SUCCESS} ]; then
+		msg "WAN information determination failure -- aborting" E "wdf"
+
+		usb_control wanoffkill
+		wan_control kill
+
+		exit ${ERR_WANID_FAIL}
+	fi
+
+	echo ${WAN_TYPE} >${PROC_WAN_TYPE}
+}
+
+
+drop_dtr()
+{
+	${DROPDTR} ${TTS_WAN} >/dev/null
+	sleep ${DTR_PAUSE}
+}
+
+
+wait_for_ppp_up()
+{
+	_MAX_FAIL_COUNT=5
+	_FAIL_COUNT=0
+
+	_COUNT=0
+
+	while [ ${_COUNT} -lt ${PPP_IF_UP_RETRIES} ]; do
+		sleep 1
+
+		if [ -r ${PPP_IP_START} ]; then
+			return
+		fi
+
+		if [ -z "`pidof ${B_PPPD}`" ]; then
+			_FAIL_COUNT=`expr ${_FAIL_COUNT} + 1`
+
+			if [ ${_FAIL_COUNT} -gt ${_MAX_FAIL_COUNT} ]; then
+				break
+			fi
+		fi
+
+		_COUNT=`expr ${_COUNT} + 1`
+	done
+
+	msg "${PPP_INTF} interface bringup failed" E "ibf"
+
+	drop_dtr
+
+	exit ${ERR_PPP_IF}
+}
+
+
+wait_for_ppp_down()
+{
+	_COUNT=0
+
+	while [ ${_COUNT} -lt ${PPP_IF_DOWN_RETRIES} ]; do
+		sleep 1
+
+		if [ -z "`pidof ${B_PPPD}`" ]; then
+			return ${ERR_SUCCESS}
+		fi
+
+		_COUNT=`expr ${_COUNT} + 1`
+	done
+
+	msg "${B_PPPD} termination failure" E "ptf"
+
+	return ${ERR_PPP_IF}
+}
+
+
+wait_for_tts()
+{
+	_COUNT=0
+
+	while [ ! -r ${TTS_WAN} -o ! -r ${TTS_DM} ]; do
+		usleep 100000
+
+		_COUNT=`expr ${_COUNT} + 1`
+		if [ ${_COUNT} -ge $1 ]; then
+			msg "USB serial device failure" E "usdf"
+			return ${ERR_NO_TTS}
+		fi
+	done
+
+	return ${ERR_SUCCESS}
+}
+
+
+start_ppp()
+{
+	if [ -n "${WAN_PEER}" ]; then
+		msg "starting ${PPPD} peer-${WAN_PEER}" I "sp"
+
+		${PPPD} call "peer-${WAN_PEER}"
+		_RES=$?
+
+	else
+		_RES=1
+
+	fi
+
+	return ${_RES}
+}
+
+
+ppp_control()
+{
+	if [ "$1" != "pppstart" -a "$1" != "pppstop" ]; then
+		msg "invalid control command \"$1\"" E "icc"
+		exit ${ERR_INVALID_CMD}
+	fi
+
+	rm -f ${PPP_IP_START} 2>/dev/null
+	rm -f ${WAN_LINK_ACTIVE} 2>/dev/null
+
+	if [ -r ${PIDF_PPPD} ]; then
+
+		 touch ${PPP_IP_STOP}
+
+		_PID=`cat ${PIDF_PPPD}`
+
+		if [ "$1" = "pppstart" -a -n "${_PID}" ]; then
+			msg "${B_PPPD} is active on a \"pppstart\"" W "psnbp"
+		fi
+
+		# disable deep idle for WAN type 3
+		if [ ${WAN_TYPE_IS_QSC} = "1" ] ; then
+			_deep_idle_state=`cat ${DEEP_IDLE_ENABLE}`
+			echo -n 0 > ${DEEP_IDLE_ENABLE}
+		fi
+
+		# msg "sending SIGINT to process ${_PID}" I "sstp"
+
+		kill -INT ${_PID} 2>/dev/null
+		_RES=$?
+
+		if [ ${_RES} -ne 0 ]; then
+			rm -f ${PIDF_PPPD}
+
+			msg "kill ${_PID} failed (${_RES})" W "kpf"
+
+			killall -KILL ${B_PPPD} 2>/dev/null
+			rm -f ${PPP_IP_STOP} 2>/dev/null
+		fi
+
+		wait_for_ppp_down
+		_RES=$?
+
+		if [ ${_RES} -ne ${ERR_SUCCESS} ]; then
+			# timeout occurred; force termination
+			killall -KILL ${B_PPPD} 2>/dev/null
+
+			sleep 1
+
+			# if the process is still there, log a critical message
+			wait_for_ppp_down
+			_RES=$?
+
+			if [ ${_RES} -ne ${ERR_SUCCESS} ]; then
+				msg ":${B_PPPD} can't be killed" C "kp2"
+			fi
+		fi
+
+		# reenable deep idle for WAN type 3
+		if [ ${WAN_TYPE_IS_QSC} = "1" ] ; then
+			echo -n ${_deep_idle_state} > ${DEEP_IDLE_ENABLE}
+		fi
+
+	else
+		if [ "$1" = "pppstop" ]; then
+			# msg "pid file not found: ${PIDF_PPPD}" I "pfnf"
+
+			# make sure there are no strays
+			killall -KILL ${B_PPPD} 2>/dev/null
+		fi
+	fi
+
+	if ! [ "${WAN_TYPE_IS_QSC}" = "1" ]; then
+		drop_dtr
+	fi
+
+	if [ "$1" = "pppstart" ]; then
+		killall -KILL ${B_PPPD} 2>/dev/null
+		rm -f ${PIDF_PPPD} 2>/dev/null
+
+		start_ppp
+		if [ ${_RES} -ne 0 ]; then
+			msg "${PPPD} start failed (${_RES})" E "psf"
+			exit ${_RES}
+		fi
+
+		wait_for_ppp_up
+	fi
+
+	return ${ERR_SUCCESS}
+}
+
+wait_for_sim_ready()
+{
+	local _COUNT=0
+	local _MAX_COUNT=5
+
+	while [ ${_COUNT} -lt ${_MAX_COUNT} ]; do
+		sleep 1
+
+		${MODEMCMD} -t 5 -e -v -c "AT+CPIN?" | head -1 | grep -q READY
+		if [ $? -eq 0 ]; then
+			sleep 2
+
+			return 0
+		fi
+
+		_COUNT=$((${_COUNT} + 1))
+	done
+
+	return 1
+}
+
+
+process_mcs_cookie()
+{
+	local _RET=0
+
+	if [ -f ${MCS_COOKIE} ]; then
+		local _MCS_OP=`cat ${MCS_COOKIE} | xargs`
+
+		rm ${MCS_COOKIE}
+
+		echo ${_MCS_OP} | grep -q \`
+		if [ $? -ne 0 ]; then
+			msg "processing MCS cookie \"${_MCS_OP}\"" I "pmc"
+
+			local _MC_TO=`echo ${_MCS_OP} | cut -d ' ' -f 1`
+			local _MC_OP=`echo ${_MCS_OP} | cut -d ' ' -f 2`
+
+			if [ -n "${_MC_TO}" -a -n "${_MC_OP}" ]; then
+				wait_for_sim_ready
+				if [ $? -eq 0 ]; then
+					${MODEMCMD} -t ${_MC_TO} -c "AT+COPS=${_MC_OP}"
+					if [ $? -ne 0 ]; then
+						msg "MCS registration failure" W "pmcw"
+					fi
+
+					if [ "${_MC_OP}" = "${MCS_SET_AUTO_MODE_OP}" ]; then
+						_RET=1
+					fi
+
+				else
+					msg "SIM initialization failure" E "pmce"
+				fi
+			fi
+		fi
+	fi
+
+	return ${_RET}
+}
+
+load_usb_modules()
+{
+	modprobe ehci_hcd
+	modprobe usbserial
+	modprobe usb_wwan
+	modprobe option
+
+	if [ "$1" != "wanontph" ]; then
+		echo 1 >${PROC_WAN_USB_EN}
+	fi
+
+	if [ "$1" != "wanontph" ]; then
+		echo -n 1 >${WAKEUP_ENABLE}
+	fi
+	echo -n 1 >${DEEP_IDLE_ENABLE}
+}
+
+
+power_down_usb()
+{
+	while [ $# -gt 0 ]; do
+		_USB_POWER_ENTRY="$1/power/state"
+		if [ -e "${_USB_POWER_ENTRY}" ]; then
+			echo -n 2 >"${_USB_POWER_ENTRY}"
+		fi
+
+		shift
+	done
+
+	sleep 2
+}
+
+
+wait_for_option_close()
+{
+	if [ -n "`lsmod | grep ^option`" ]; then
+		local _OPTION_RETRIES=5
+		local _OPTION_COUNT=0
+
+		while [ "`lsmod | awk /^option/' { print $3 }'`" -ne "0" ]; do
+			sleep 1
+
+			_OPTION_COUNT=`expr ${_OPTION_COUNT} + 1`
+			if [ ${_OPTION_COUNT} -ge ${_OPTION_RETRIES} ]; then
+				msg "USB option driver still in use" C "uodsiu"
+				return ${_OPTION_COUNT}
+			fi
+		done
+		return ${_OPTION_COUNT}
+	fi
+	return 0
+}
+
+
+unload_usb_modules()
+{
+	wait_for_option_close
+	ref_cnt=$?
+	echo -n 0 >${WAKEUP_ENABLE}
+	echo 0 >${PROC_WAN_USB_EN}
+
+	if [ $ref_cnt -ne 0 ] ; then
+		# USB disconect event will progagate from ehci to option
+		# to user space. If option driver was still used before
+		# de-asserting USB, wait for option ref count to reach 0
+		# before removing usb modules.
+		wait_for_option_close
+
+	fi
+
+	# wait an additonal 2 seconds to make sure there is no
+	# race condition in the USB layer while the device is
+	# in disconnecting stage
+	sleep 2
+	rmmod -s option
+	rmmod -s usb_wwan
+	rmmod -s usbserial
+	rmmod -s ehci_hcd
+}
+
+
+usb_control()
+{
+	case "$1" in
+
+		wanon | devicewake | wanontph)
+			load_usb_modules $1
+			;;
+
+		wanoffkill | wanoff | devicesleep )
+			unload_usb_modules $1 2>/dev/null
+			;;
+		*)
+			msg "invalid usb control request" E "iucr"
+			;;
+
+	esac
+}
+
+
+wan_control()
+{
+	case "$1" in
+
+		off)
+			echo 0 >${PROC_WAN_POWER}
+			;;
+
+		on)
+			echo 1 >${PROC_WAN_POWER}
+			;;
+
+		kill)
+			echo 2 >${PROC_WAN_POWER}
+			;;
+
+		*)
+			msg "invalid power state request" E "ipsr"
+			;;
+
+	esac
+}
+
+power_wan_on()
+{
+
+	if [ "$1" = "wanon" ]; then
+		wan_control on
+		sleep 1
+	fi
+
+	usb_control $1
+
+	if [ -z "${WAN_TYPE}" ]; then
+		_TTS_RETRIES=150
+	else
+		_TTS_RETRIES=60
+	fi
+
+	wait_for_tts ${_TTS_RETRIES}
+	_RES=$?
+
+	if [ ${_RES} -ne ${ERR_SUCCESS} ]; then
+		msg "WAN USB serial port failure -- aborting" E "wspf"
+
+		usb_control wanoffkill
+		wan_control kill
+
+		exit ${ERR_NO_TTS}
+	fi
+
+	msg "WAN USB serial ports initialized" I "wspi"
+
+	echo -n 1 >${WAKEUP_ENABLE}
+	echo -n 1 >${DEEP_IDLE_ENABLE}
+
+	${MODEMCMD} -t 5 -c "AT+CFUN=1"
+
+	init_wan_info
+}
+
+
+power_wan_off()
+{
+	ppp_control pppstop
+
+	# perform an explicit network detach for devicesleep and wanoff
+	if [ "$1" == "devicesleep" -o "$1" == "wanoff" ] ; then
+		msg "explicit network detach" I "pwr"
+		${MODEMCMD} -t 5 -c "AT+CFUN=0"
+	fi
+
+	usb_control $1
+
+	case "$1" in
+
+		wanoff)
+			wan_control off
+			;;
+
+		wanoffkill)
+			wan_control kill
+			;;
+
+	esac
+}
+
+
+# change to root directory
+cd /
+
+if [ "$#" -eq 1 ]; then
+
+	msg "processing \"$1\"" I "pc"
+
+	case "$1" in
+
+		wanon | devicewake)
+			power_wan_on "$1"
+			msg "WAN_TYPE_IS_QSC = ${WAN_TYPE_IS_QSC}"
+
+			if [ "${WAN_TYPE_IS_QSC}" = "1" ]; then
+				process_mcs_cookie
+				if [ $? -eq 1 ]; then
+					# auto carrier select requires a WAN reboot
+					# This should be done for other failure cases too
+                                        # TODO: Verify why we need this verson. scchang thinks previous one
+                                        # is sufficient but this is what is in manta currently
+                                        msg "process_mcs_cookie returned 1"
+					echo 0 > ${PROC_WAN_USB_EN}
+					sleep 1
+					usb_control wanoffkill
+					sleep 5
+					wan_control kill
+
+					power_wan_on "wanon"
+				fi
+			fi
+			;;
+
+		rfoff)
+			${MODEMCMD} -t 5 -c "AT+CFUN=0"
+			;;
+
+		wanoff | wanoffkill)
+			power_wan_off "$1"
+			;;
+
+		wanontph)
+			wan_control on
+			usb_control "$1"
+			;;
+
+		devicesleep)
+			power_wan_off devicesleep
+			;;
+
+		rfon)
+			${MODEMCMD} -t 5 -c "AT+CFUN=1"
+			;;
+
+		*)
+			ppp_control "$1"
+			;;
+
+	esac
+
+else
+	msg "usage: $0 [wanon|wanontph|wanoff|wanoffkill|devicewake|devicesleep|rfoff|rfon|pppstart|pppstop]" W "wu"
+	exit ${ERR_INVALID_CMD}
+fi
+
+exit ${ERR_SUCCESS}
